@@ -121,6 +121,30 @@ static boolean _mountpoint_mounted(char *mp)
     return false;
 }
 
+static char *partition_mount_point(struct partition *this)
+{
+    return this->volume->mount_point[this->index];
+}
+static volume_state_t *partition_state(struct partition *this)
+{
+    return &this->volume->state[this->index];
+}
+static struct volmgr_fstable_entry *partition_fs(struct partition *this)
+{
+    return &this->volume->fs[this->index];
+}
+
+static partition_t partition(volume_t *volume, int index)
+{
+    return partition {
+        .volume = volume,
+        .index  = index,
+        .mount_point = &partition_mount_point;
+        .state = &partition_state;
+        .fs = &partition_fs;
+    };
+}
+
 /*
  * Public functions
  */
@@ -274,11 +298,12 @@ int volmgr_consider_disk(blkdev_t *dev)
 
     pthread_mutex_lock(&vol->lock);
 
+    /* PPP: what are we doing here?
     if (vol->state == volstate_mounted) {
         LOGE("Volume %s already mounted (did we just crash?)", vol->mount_point);
         pthread_mutex_unlock(&vol->lock);
         return 0;
-    }
+    }*/
 
     int rc =  _volmgr_consider_disk_and_vol(vol, dev);
     pthread_mutex_unlock(&vol->lock);
@@ -517,7 +542,7 @@ static int _volmgr_consider_disk_and_vol(volume_t *vol, blkdev_t *dev)
     int rc = 0;
 
 #if DEBUG_VOLMGR
-    LOG_VOL("volmgr_consider_disk_and_vol(%s, %d:%d):", vol->mount_point,
+    LOG_VOL("volmgr_consider_disk_and_vol(%s, %d:%d):", vol->mount_point[1],
             dev->major, dev->minor); 
 #endif
 
@@ -564,13 +589,14 @@ static int _volmgr_consider_disk_and_vol(volume_t *vol, blkdev_t *dev)
                 dev->major, dev->minor, rc);
 #endif
     } else {
+        rc = -ENODEV;
+
         /*
          * Device has multiple partitions
          * This is where interesting partition policies could be implemented.
          * For now just try them in sequence until one succeeds
-         */
-   
-        rc = -ENODEV;
+         */   
+        
         int i;
         for (i = 0; i < dev->nr_parts; i++) {
             blkdev_t *part = blkdev_lookup_by_devno(dev->major, (i+1));
@@ -578,12 +604,13 @@ static int _volmgr_consider_disk_and_vol(volume_t *vol, blkdev_t *dev)
                 LOGE("Error - unable to lookup partition for blkdev %d:%d", dev->major, (i+1));
                 continue;
             }
-            rc = _volmgr_start(vol, part);
+            partition_t partition = partition(vol, i+1);
+            rc = _volmgr_start(&partition, part);
 #if DEBUG_VOLMGR
             LOG_VOL("_volmgr_start(%s, %d:%d) rc = %d",
-                    vol->mount_point, part->major, part->minor, rc);
+                    partition->mount_point(), part->major, part->minor, rc);
 #endif
-            if (!rc || rc == -EBUSY) 
+            if (rc == -EBUSY) 
                 break;
         }
 
@@ -875,6 +902,8 @@ static int volmgr_config_volume(cnode *node)
             }
         } else if (!strcmp(child->name, "mount_point"))
             new->mount_point = strdup(child->value);
+        else if (!strcmp(child->name, "partition"))
+            new->partition = atoi(child->value);
         else if (!strcmp(child->name, "ums_path"))
             new->ums_path = strdup(child->value);
         else if (!strcmp(child->name, "dm_src")) 
@@ -1021,18 +1050,18 @@ static volume_t *volmgr_lookup_volume_by_mediapath(char *media_path, boolean fuz
  *     - ENODATA - Unsupported filesystem type / blank
  * vol->lock MUST be held!
  */
-static int _volmgr_start(volume_t *vol, blkdev_t *dev)
+static int _volmgr_start(partition_t *partition, blkdev_t *dev)
 {
     struct volmgr_fstable_entry *fs;
     int rc = ENODATA;
 
 #if DEBUG_VOLMGR
-    LOG_VOL("_volmgr_start(%s, %d:%d):", vol->mount_point,
+    LOG_VOL("_volmgr_start(%s, %d:%d):", partition->mount_point(),
             dev->major, dev->minor);
 #endif
 
-    if (vol->state == volstate_mounted) {
-        LOGE("Unable to start volume '%s' (already mounted)", vol->mount_point);
+    if (*partition->state() == volstate_mounted) {
+        LOGE("Unable to start volume '%s' (already mounted)", partition->mount_point());
         return -EBUSY;
     }
 
@@ -1043,16 +1072,17 @@ static int _volmgr_start(volume_t *vol, blkdev_t *dev)
 
     if (!fs) {
         LOGE("No supported filesystems on %d:%d", dev->major, dev->minor);
-        volume_setstate(vol, volstate_nofs);
+        volume_setstate(partition, volstate_nofs);
         return -ENODATA;
     }
 
-    return volmgr_start_fs(fs, vol, dev);
+    return volmgr_start_fs(fs, partition, dev);
 }
 
 // vol->lock MUST be held!
-static int volmgr_start_fs(struct volmgr_fstable_entry *fs, volume_t *vol, blkdev_t *dev)
+static int volmgr_start_fs(struct volmgr_fstable_entry *fs, partition_t *partition, blkdev_t *dev)
 {
+    volume_t *vol = partition->vol;
     /*
      * Spawn a thread to do the actual checking / mounting in
      */
@@ -1066,9 +1096,9 @@ static int volmgr_start_fs(struct volmgr_fstable_entry *fs, volume_t *vol, blkde
     vol->dev = dev; 
 
     if (bootstrap) {
-        LOGI("Aborting start of %s (bootstrap = %d)\n", vol->mount_point,
+        LOGI("Aborting start of %s (bootstrap = %d)\n", partition->mount_point(),
              bootstrap);
-        vol->state = volstate_unmounted;
+        *partition->state() = volstate_unmounted;
         return -EBUSY;
     }
 
@@ -1079,7 +1109,7 @@ static int volmgr_start_fs(struct volmgr_fstable_entry *fs, volume_t *vol, blkde
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-    pthread_create(&vol->worker_thread, &attr, volmgr_start_fs_thread, vol);
+    pthread_create(&vol->worker_thread, &attr, volmgr_start_fs_thread, partition);
 
     return 0;
 }
@@ -1103,7 +1133,8 @@ static void __start_fs_thread_lock_cleanup(void *arg)
 
 static void *volmgr_start_fs_thread(void *arg)
 {
-    volume_t *vol = (volume_t *) arg;
+    partition_t *part = (partition_t *) arg;
+    volume_t *vol = part->volume;
 
     pthread_cleanup_push(__start_fs_thread_lock_cleanup, arg);
     pthread_mutex_lock(&vol->lock);
@@ -1125,7 +1156,7 @@ static void *volmgr_start_fs_thread(void *arg)
   
 #if DEBUG_VOLMGR
     LOG_VOL("Worker thread pid %d starting %s fs %d:%d on %s", getpid(),
-             fs->name, dev->major, dev->minor, vol->mount_point);
+             fs->name, dev->major, dev->minor, partition->mount_point());
 #endif
 
     if (fs->check_fn) {
@@ -1133,11 +1164,11 @@ static void *volmgr_start_fs_thread(void *arg)
         LOG_VOL("Starting %s filesystem check on %d:%d", fs->name,
                 dev->major, dev->minor);
 #endif
-        volume_setstate(vol, volstate_checking);
+        volume_setstate(partition, volstate_checking);
         pthread_mutex_unlock(&vol->lock);
         rc = fs->check_fn(dev);
         pthread_mutex_lock(&vol->lock);
-        if (vol->state != volstate_checking) {
+        if (*partition->state() != volstate_checking) {
             LOGE("filesystem check aborted");
             goto out;
         }
@@ -1146,7 +1177,7 @@ static void *volmgr_start_fs_thread(void *arg)
             LOGE("%s filesystem check failed on %d:%d (%s)", fs->name,
                     dev->major, dev->minor, strerror(-rc));
             if (rc == -ENODATA) {
-               volume_setstate(vol, volstate_nofs);
+               volume_setstate(partition, volstate_nofs);
                goto out;
             }
             goto out_unmountable;
@@ -1157,13 +1188,13 @@ static void *volmgr_start_fs_thread(void *arg)
 #endif
     }
 
-    rc = fs->mount_fn(dev, vol, safe_mode);
+    rc = fs->mount_fn(dev, partition, safe_mode);
     if (!rc) {
         LOGI("Sucessfully mounted %s filesystem %d:%d on %s (safe-mode %s)",
-                fs->name, dev->major, dev->minor, vol->mount_point,
+                fs->name, dev->major, dev->minor, partition->mount_point(),
                 (safe_mode ? "on" : "off"));
-        vol->fs = fs;
-        volume_setstate(vol, volstate_mounted);
+        *partition->fs() = fs;
+        volume_setstate(partition, volstate_mounted);
         goto out;
     }
 
@@ -1171,7 +1202,7 @@ static void *volmgr_start_fs_thread(void *arg)
          dev->minor, rc);
 
  out_unmountable:
-    volume_setstate(vol, volstate_damaged);
+    volume_setstate(partition, volstate_damaged);
  out:
     pthread_cleanup_pop(1);
     pthread_exit(NULL);
@@ -1183,18 +1214,18 @@ static void volmgr_start_fs_thread_sighandler(int signo)
     LOGE("Volume startup thread got signal %d", signo);
 }
 
-static void volume_setstate(volume_t *vol, volume_state_t state)
+static void volume_setstate(partition_t *partition, volume_state_t state)
 {
-    if (state == vol->state)
+    if (state == *partition->state())
         return;
 
 #if DEBUG_VOLMGR
     LOG_VOL("Volume %s state change from %d -> %d", vol->mount_point, vol->state, state);
 #endif
     
-    vol->state = state;
+    *partition->state = state;
     
-    char *prop_val = conv_volstate_to_propstr(vol->state);
+    char *prop_val = conv_volstate_to_propstr(state);
 
     if (prop_val) {
         property_set(PROP_EXTERNAL_STORAGE_STATE, prop_val);
@@ -1204,9 +1235,9 @@ static void volume_setstate(volume_t *vol, volume_state_t state)
 
 static int volume_send_state(volume_t *vol)
 {
-    char *event = conv_volstate_to_eventstr(vol->state);
+    char *event = conv_volstate_to_eventstr(vol->state[0]);
 
-    return send_msg_with_data(event, vol->mount_point);
+    return send_msg_with_data(event, vol->mount_point[1]);
 }
 
 static char *conv_volstate_to_eventstr(volume_state_t state)

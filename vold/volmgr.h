@@ -76,12 +76,13 @@ typedef enum volume_state {
 } volume_state_t;
 
 struct volume;
+struct partition;
 
 struct volmgr_fstable_entry {
     char *name;
     int     (*identify_fn) (blkdev_t *dev);
     int     (*check_fn) (blkdev_t *dev);
-    int     (*mount_fn) (blkdev_t *dev, struct volume *vol, boolean safe_mode);
+    int     (*mount_fn) (blkdev_t *dev, struct partition *partition, boolean safe_mode);
     boolean case_sensitive_paths;
 };
 
@@ -96,17 +97,18 @@ struct volmgr_reaper_args {
 };
 
 #define VOLMGR_MAX_MEDIAPATHS_PER_VOLUME 8
+#define VOLMGR_MAX_PARTITIONS_PER_VOLUME 8
 
 typedef struct volume {
     char            *media_paths[VOLMGR_MAX_MEDIAPATHS_PER_VOLUME];
 
     media_type_t      media_type;
-    char              *mount_point;
+    char              *mount_point[VOLMGR_MAX_PARTITIONS_PER_VOLUME];
     char              *ums_path;
     struct devmapping *dm;
 
     pthread_mutex_t          lock;
-    volume_state_t           state;
+    volume_state_t           state[VOLMGR_MAX_PARTITIONS_PER_VOLUME];
     blkdev_t                 *dev;
     pid_t                    worker_pid;
     pthread_t                worker_thread;
@@ -117,10 +119,18 @@ typedef struct volume {
     boolean                  worker_running;
     pthread_mutex_t          worker_sem;
 
-    struct volmgr_fstable_entry *fs;
+    struct volmgr_fstable_entry *fs[VOLMGR_MAX_PARTITIONS_PER_VOLUME];
 
     struct volume            *next;
 } volume_t;
+
+typedef struct partition {
+    volume_t         *volume;
+    int               index;
+    char           *(*mount_point)(struct partition *this);
+    volume_state_t *(*state)(struct partition *this);
+    struct volmgr_fstable_entry *(*fs)(struct partition *this);
+} partition_t;
 
 int volmgr_consider_disk(blkdev_t *dev);
 int volmgr_notify_eject(blkdev_t *dev, void (* cb) (blkdev_t *));
